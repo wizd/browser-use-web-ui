@@ -35,6 +35,10 @@ RUN apt-get update && apt-get install -y \
     procps \
     git \
     python3-numpy \
+    fontconfig \
+    fonts-dejavu \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
     && rm -rf /var/lib/apt/lists/*
 
 # Install noVNC
@@ -43,11 +47,8 @@ RUN git clone https://github.com/novnc/noVNC.git /opt/novnc \
     && ln -s /opt/novnc/vnc.html /opt/novnc/index.html
 
 # Install Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | tee /etc/apt/sources.list.d/google-chrome.list
 
 # Set up working directory
 WORKDIR /app
@@ -60,6 +61,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install --with-deps chromium
 RUN playwright install-deps
+RUN apt-get install -y google-chrome-stable
 
 # Copy the application code
 COPY . .
@@ -72,6 +74,9 @@ ENV ANONYMIZED_TELEMETRY=false
 ENV DISPLAY=:99
 ENV RESOLUTION=1920x1080x24
 ENV VNC_PASSWORD=vncpassword
+ENV CHROME_PERSISTENT_SESSION=true
+ENV RESOLUTION_WIDTH=1920
+ENV RESOLUTION_HEIGHT=1080
 
 # Set up supervisor configuration
 RUN mkdir -p /var/log/supervisor

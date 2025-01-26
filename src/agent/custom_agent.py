@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2025/1/2
-# @Author  : wenshao
-# @ProjectName: browser-use-webui
-# @FileName: custom_agent.py
-
 import json
 import logging
 import pdb
@@ -20,9 +14,11 @@ from browser_use.agent.views import (
     ActionResult,
     AgentHistoryList,
     AgentOutput,
+    AgentHistory,
 )
 from browser_use.browser.browser import Browser
 from browser_use.browser.context import BrowserContext
+from browser_use.browser.views import BrowserStateHistory
 from browser_use.controller.service import Controller
 from browser_use.telemetry.views import (
     AgentEndTelemetryEvent,
@@ -34,6 +30,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
     BaseMessage,
 )
+from src.utils.agent_state import AgentState
 
 from .custom_massage_manager import CustomMassageManager
 from .custom_views import CustomAgentOutput, CustomAgentStepInfo
@@ -72,6 +69,7 @@ class CustomAgent(Agent):
             max_error_length: int = 400,
             max_actions_per_step: int = 10,
             tool_call_in_content: bool = True,
+            agent_state: AgentState = None,
     ):
         super().__init__(
             task=task,
@@ -91,7 +89,15 @@ class CustomAgent(Agent):
             max_actions_per_step=max_actions_per_step,
             tool_call_in_content=tool_call_in_content,
         )
+        if hasattr(self.llm, 'model_name') and self.llm.model_name in ["deepseek-reasoner"]:
+            # deepseek-reasoner does not support function calling
+            self.use_function_calling = False
+            # TODO: deepseek-reasoner only support 64000 context
+            self.max_input_tokens = 64000
+        else:
+            self.use_function_calling = True
         self.add_infos = add_infos
+        self.agent_state = agent_state
         self.message_manager = CustomMassageManager(
             llm=self.llm,
             task=self.task,
@@ -102,6 +108,7 @@ class CustomAgent(Agent):
             max_error_length=self.max_error_length,
             max_actions_per_step=self.max_actions_per_step,
             tool_call_in_content=tool_call_in_content,
+            use_function_calling=self.use_function_calling
         )
 
     def _setup_action_models(self) -> None:
@@ -122,7 +129,8 @@ class CustomAgent(Agent):
 
         logger.info(f"{emoji} Eval: {response.current_state.prev_action_evaluation}")
         logger.info(f"🧠 New Memory: {response.current_state.important_contents}")
-        logger.info(f"⏳ Task Progress: {response.current_state.completed_contents}")
+        logger.info(f"⏳ Task Progress: \n{response.current_state.task_progress}")
+        logger.info(f"📋 Future Plans: \n{response.current_state.future_plans}")
         logger.info(f"🤔 Thought: {response.current_state.thought}")
         logger.info(f"🎯 Summary: {response.current_state.summary}")
         for i, action in enumerate(response.action):
@@ -148,28 +156,54 @@ class CustomAgent(Agent):
         ):
             step_info.memory += important_contents + "\n"
 
-        completed_contents = model_output.current_state.completed_contents
-        if completed_contents and "None" not in completed_contents:
-            step_info.task_progress = completed_contents
+        task_progress = model_output.current_state.task_progress
+        if task_progress and "None" not in task_progress:
+            step_info.task_progress = task_progress
+
+        future_plans = model_output.current_state.future_plans
+        if future_plans and "None" not in future_plans:
+            step_info.future_plans = future_plans
 
     @time_execution_async("--get_next_action")
     async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
         """Get next action from LLM based on current state"""
-        try:
-            structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
-            response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+        if self.use_function_calling:
+            try:
+                structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
+                response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
 
-            parsed: AgentOutput = response['parsed']
-            # cut the number of actions to max_actions_per_step
-            parsed.action = parsed.action[: self.max_actions_per_step]
-            self._log_response(parsed)
-            self.n_steps += 1
+                parsed: AgentOutput = response['parsed']
+                # cut the number of actions to max_actions_per_step
+                parsed.action = parsed.action[: self.max_actions_per_step]
+                self._log_response(parsed)
+                self.n_steps += 1
 
-            return parsed
-        except Exception as e:
-            # If something goes wrong, try to invoke the LLM again without structured output,
-            # and Manually parse the response. Temporarily solution for DeepSeek
+                return parsed
+            except Exception as e:
+                # If something goes wrong, try to invoke the LLM again without structured output,
+                # and Manually parse the response. Temporarily solution for DeepSeek
+                ret = self.llm.invoke(input_messages)
+                if isinstance(ret.content, list):
+                    parsed_json = json.loads(ret.content[0].replace("```json", "").replace("```", ""))
+                else:
+                    parsed_json = json.loads(ret.content.replace("```json", "").replace("```", ""))
+                parsed: AgentOutput = self.AgentOutput(**parsed_json)
+                if parsed is None:
+                    raise ValueError(f'Could not parse response.')
+
+                # cut the number of actions to max_actions_per_step
+                parsed.action = parsed.action[: self.max_actions_per_step]
+                self._log_response(parsed)
+                self.n_steps += 1
+
+                return parsed
+        else:
             ret = self.llm.invoke(input_messages)
+            if not self.use_function_calling:
+                self.message_manager._add_message_with_tokens(ret)
+            logger.info(f"🤯 Start Deep Thinking: ")
+            logger.info(ret.reasoning_content)
+            logger.info(f"🤯 End Deep Thinking")
             if isinstance(ret.content, list):
                 parsed_json = json.loads(ret.content[0].replace("```json", "").replace("```", ""))
             else:
@@ -199,14 +233,23 @@ class CustomAgent(Agent):
             input_messages = self.message_manager.get_messages()
             model_output = await self.get_next_action(input_messages)
             self.update_step_info(model_output, step_info)
-            logger.info(f"🧠 All Memory: {step_info.memory}")
+            logger.info(f"🧠 All Memory: \n{step_info.memory}")
             self._save_conversation(input_messages, model_output)
-            self.message_manager._remove_last_state_message()  # we dont want the whole state in the chat history
-            self.message_manager.add_model_output(model_output)
+            if self.use_function_calling:
+                self.message_manager._remove_last_state_message()  # we dont want the whole state in the chat history
+                self.message_manager.add_model_output(model_output)
 
             result: list[ActionResult] = await self.controller.multi_act(
                 model_output.action, self.browser_context
             )
+            if len(result) != len(model_output.action):
+                # I think something changes, such information should let LLM know
+                for ri in range(len(result), len(model_output.action)):
+                    result.append(ActionResult(extracted_content=None,
+                                                include_in_memory=True,
+                                                error=f"{model_output.action[ri].model_dump_json(exclude_unset=True)} is Failed to execute. \
+                                                    Something new appeared after action {model_output.action[len(result) - 1].model_dump_json(exclude_unset=True)}",
+                                                is_done=False))
             self._last_result = result
 
             if len(result) > 0 and result[-1].is_done:
@@ -364,12 +407,25 @@ class CustomAgent(Agent):
                 max_steps=max_steps,
                 memory="",
                 task_progress="",
+                future_plans=""
             )
 
             for step in range(max_steps):
+                # 1) Check if stop requested
+                if self.agent_state and self.agent_state.is_stop_requested():
+                    logger.info("🛑 Stop requested by user")
+                    self._create_stop_history_item()
+                    break
+
+                # 2) Store last valid state before step
+                if self.browser_context and self.agent_state:
+                    state = await self.browser_context.get_state(use_vision=self.use_vision)
+                    self.agent_state.set_last_valid_state(state)
+
                 if self._too_many_failures():
                     break
 
+                # 3) Do the step
                 await self.step(step_info)
 
                 if self.history.is_done():
@@ -403,3 +459,61 @@ class CustomAgent(Agent):
 
             if self.generate_gif:
                 self.create_history_gif()
+
+    def _create_stop_history_item(self):
+        """Create a history item for when the agent is stopped."""
+        try:
+            # Attempt to retrieve the last valid state from agent_state
+            state = None
+            if self.agent_state:
+                last_state = self.agent_state.get_last_valid_state()
+                if last_state:
+                    # Convert to BrowserStateHistory
+                    state = BrowserStateHistory(
+                        url=getattr(last_state, 'url', ""),
+                        title=getattr(last_state, 'title', ""),
+                        tabs=getattr(last_state, 'tabs', []),
+                        interacted_element=[None],
+                        screenshot=getattr(last_state, 'screenshot', None)
+                    )
+                else:
+                    state = self._create_empty_state()
+            else:
+                state = self._create_empty_state()
+
+            # Create a final item in the agent history indicating done
+            stop_history = AgentHistory(
+                model_output=None,
+                state=state,
+                result=[ActionResult(extracted_content=None, error=None, is_done=True)]
+            )
+            self.history.history.append(stop_history)
+
+        except Exception as e:
+            logger.error(f"Error creating stop history item: {e}")
+            # Create empty state as fallback
+            state = self._create_empty_state()
+            stop_history = AgentHistory(
+                model_output=None,
+                state=state,
+                result=[ActionResult(extracted_content=None, error=None, is_done=True)]
+            )
+            self.history.history.append(stop_history)
+
+    def _convert_to_browser_state_history(self, browser_state):
+        return BrowserStateHistory(
+            url=getattr(browser_state, 'url', ""),
+            title=getattr(browser_state, 'title', ""),
+            tabs=getattr(browser_state, 'tabs', []),
+            interacted_element=[None],
+            screenshot=getattr(browser_state, 'screenshot', None)
+        )
+
+    def _create_empty_state(self):
+        return BrowserStateHistory(
+            url="",
+            title="",
+            tabs=[],
+            interacted_element=[None],
+            screenshot=None
+        )

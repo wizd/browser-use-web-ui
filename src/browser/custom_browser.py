@@ -1,10 +1,5 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2025/1/2
-# @Author  : wenshao
-# @ProjectName: browser-use-webui
-# @FileName: browser.py
-
 import asyncio
+import pdb
 
 from playwright.async_api import Browser as PlaywrightBrowser
 from playwright.async_api import (
@@ -19,7 +14,6 @@ from browser_use.browser.context import BrowserContext, BrowserContextConfig
 from playwright.async_api import BrowserContext as PlaywrightBrowserContext
 import logging
 
-from .config import BrowserPersistenceConfig
 from .custom_context import CustomBrowserContext
 
 logger = logging.getLogger(__name__)
